@@ -500,6 +500,27 @@ Your explanation:"""
             logger.error(f"Failed to explain similarity: {e}")
             return f"Similar decision context (score: {similarity_score:.2f})"
     
+    async def chat(self, prompt: str) -> str:
+        """
+        Generate a response from the LLM for a given prompt.
+        
+        Args:
+            prompt: User prompt or system instruction
+            
+        Returns:
+            Generated text response
+        """
+        if not self.is_available():
+            raise ValueError("Gemini service not available")
+            
+        try:
+            response = self._model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Chat generation failed: {e}")
+            raise RuntimeError(f"Chat generation failed: {str(e)}")
+
+    
     def check_status(self) -> Dict[str, Any]:
         """
         Check Gemini service status.

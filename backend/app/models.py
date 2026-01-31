@@ -463,3 +463,34 @@ class APIError(BaseModel):
         default=None,
         description="Additional error details"
     )
+
+
+# =============================================================================
+# EMPLOYEE PORTAL MODELS
+# =============================================================================
+
+class DiscountRequest(BaseModel):
+    """
+    Employee-submitted discount request
+    """
+    customer_name: str
+    requested_discount: str
+    reason: str
+    requestor_email: str
+
+
+class EnrichedRequest(BaseModel):
+    """
+    Request enriched with context, policy evaluation, and precedents
+    """
+    request_id: str
+    customer_name: str
+    requested_discount: str
+    reason: str
+    requestor_email: str
+    enrichment: Dict[str, Any]
+    policy_evaluation: Dict[str, Any]
+    precedents: List[Dict[str, Any]]
+    requires_approval: bool
+    approval_level: str
+

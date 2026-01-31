@@ -16,6 +16,8 @@ Endpoints:
 """
 import logging
 import os
+import uuid
+import json
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -24,7 +26,7 @@ load_dotenv()
 from datetime import datetime
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import (
@@ -35,18 +37,21 @@ from .models import (
     EmailMessage,
     PolicyVersionResponse,
     APIError,
+    DiscountRequest,
+    EnrichedRequest,
 )
 from .decision_engine import decision_engine
 from .gmail_service import gmail_service
 from .gemini_service import gemini_service
 from .policy_store import get_all_policies, get_current_policy
-from .mock_apis import router as mock_api_router
+from .mock_apis import router as mock_api_router, get_all_customer_data
 from .neo4j_service import neo4j_service
 from .graph_operations import (
     save_decision_trace,
     get_decision_by_id,
     get_pattern_analysis,
-    list_recent_decisions
+    list_recent_decisions,
+    find_semantic_precedents
 )
 from .gmail_monitor import gmail_monitor
 
@@ -795,3 +800,190 @@ async def shutdown_event():
     """Application shutdown tasks."""
     logger.info("Context Graph Decision Engine shutting down...")
     neo4j_service.close()
+
+
+# =============================================================================
+# EMPLOYEE PORTAL ENDPOINTS
+# =============================================================================
+
+@app.post("/request/submit", response_model=EnrichedRequest, tags=["Employee Portal"])
+async def submit_request(request: DiscountRequest):
+    """
+    Employee submits discount request.
+    
+    Returns enriched data immediately:
+    1. Customer data (CRM, support, finance)
+    2. Policy evaluation (limits, exceptions)
+    3. Similar precedents
+    4. Required approval level
+    """
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    
+    # 1. Gather context from mock APIs
+    context = await get_all_customer_data(request.customer_name)
+    
+    if not context["customer_found"]:
+        # Mock data if not found for smoother demo
+        context["crm"] = {"arr": 0, "industry": "Unknown", "tier": "Unknown"}
+        context["support"] = {"sev1_tickets": 0, "sev2_tickets": 0}
+        context["finance"] = {"margin_percent": 0.0, "payment_history": "Unknown"}
+    
+    # 2. Get policy and evaluate
+    policy = get_current_policy()
+    
+    # Simple parsing of requested discount (assuming "18%" or "18")
+    try:
+        requested_pct = float(str(request.requested_discount).replace('%', '').strip())
+    except ValueError:
+        requested_pct = 0.0
+        
+    # Get limits from policy
+    limits = policy.get('rules', {}).get('discount_limits', {})
+    standard_limit = float(str(limits.get('standard_limit', '10%')).replace('%', ''))
+    manager_limit = float(str(limits.get('manager_limit', '15%')).replace('%', ''))
+    
+    requires_approval = requested_pct > standard_limit
+    
+    approval_level = "auto_approved"
+    if requires_approval:
+        if requested_pct <= manager_limit:
+            approval_level = "manager"
+        else:
+            approval_level = "vp"
+    
+    # 3. Find precedents
+    precedents = await find_semantic_precedents(
+        decision_summary=f"{request.reason} for {request.customer_name}",
+        customer_industry=context['crm'].get('industry'),
+        customer_arr=context['crm'].get('arr'),
+        decision_type="discount_approval"
+    )
+    
+    # Construct response
+    enriched = EnrichedRequest(
+        request_id=request_id,
+        customer_name=request.customer_name,
+        requested_discount=request.requested_discount,
+        reason=request.reason,
+        requestor_email=request.requestor_email,
+        enrichment={
+            "crm": context['crm'] or {},
+            "support": context['support'] or {},
+            "finance": context['finance'] or {}
+        },
+        policy_evaluation={
+            "version": policy['version'],
+            "standard_limit": f"{standard_limit}%",
+            "exceeds_limit": requires_approval,
+            "deviation": f"{requested_pct - standard_limit}%" if requires_approval else "0%"
+        },
+        precedents=[
+            {
+                "customer": p.customer,
+                "outcome": p.outcome,
+                "similarity": p.similarity_score
+            }
+            for p in precedents[:5]
+        ],
+        requires_approval=requires_approval,
+        approval_level=approval_level
+    )
+    
+    # Store request temporarily (mock storage)
+    # in a real app, save to DB
+    
+    return enriched
+
+
+@app.post("/request/{request_id}/send-email", tags=["Employee Portal"])
+async def send_approval_email(request_id: str, manager_email: str):
+    """
+    Generate and send approval request email to manager.
+    Mocks the email sending process.
+    """
+    # For demo, return formatted email text
+    email_body = (
+        f"Hi Manager,\n\n"
+        f"Discount approval request (ID: {request_id})\n\n"
+        f"Please reply with approval or rejection."
+    )
+    
+    return {
+        "request_id": request_id,
+        "email_subject": f"Discount Approval Request",
+        "email_body": email_body,
+        "to": manager_email,
+        "status": "sent"
+    }
+
+
+@app.get("/request/{request_id}/status", tags=["Employee Portal"])
+async def check_request_status(request_id: str):
+    """
+    Check if request has been approved.
+    Mocks the approval process (auto-approves after delay).
+    """
+    # Simulate approval
+    return {
+        "request_id": request_id,
+        "status": "approved",
+        "approver_email": "jane.manager@company.com",
+        "final_discount": "15%",
+        "reasoning": "Approved based on similar precedents.",
+        "approved_at": datetime.utcnow().isoformat()
+    }
+
+
+@app.post("/chat", tags=["Employee Portal"])
+async def chat_with_knowledge_graph(request: dict = Body(...)) -> dict:
+    """
+    LLM chatbot that queries knowledge graph.
+    """
+    question = request.get("question")
+    if not question:
+        raise HTTPException(status_code=400, detail="Missing question")
+        
+    # 1. Generate Cypher query
+    query_prompt = (
+        f"You are a Neo4j Cypher query expert.\n"
+        f"User question: \"{question}\"\n"
+        f"Generate a Cypher query to answer this question.\n"
+        f"Available node types: Decision, Person, Policy, Customer\n"
+        f"Available relationships: REQUESTED_BY, APPROVED_BY, EVALUATED, FOR_CUSTOMER\n\n"
+        f"Return ONLY the Cypher query."
+    )
+    
+    cypher_query = await gemini_service.chat(query_prompt)
+    
+    # Clean up query
+    if cypher_query.startswith('```'):
+        cypher_query = cypher_query.split('```')[1].replace('cypher', '').strip()
+        
+    # 2. Execute query
+    records = []
+    if neo4j_service.is_connected():
+        try:
+            with neo4j_service.get_session() as session:
+                result = session.run(cypher_query)
+                records = [dict(record) for record in result]
+        except Exception as e:
+            logger.error(f"Cypher execution failed: {e}")
+            pass
+            
+    # 3. Format answer
+    # 3. Format answer
+    answer_prompt = (
+        f"User asked: \"{question}\"\n"
+        f"Query results: {json.dumps(records, default=str)}\n\n"
+        f"Format this into a clear, natural language answer."
+    )
+    
+    answer = await gemini_service.chat(answer_prompt)
+    
+    return {
+        "question": question,
+        "answer": answer,
+        "data": records,
+        "cypher_query": cypher_query
+    }
+
