@@ -416,6 +416,7 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(..., description="Overall health status")
     gmail: str = Field(default="not_checked", description="Gmail connection status")
     gemini: str = Field(default="not_checked", description="Gemini API status")
+    neo4j: str = Field(default="not_checked", description="Neo4j connection status")
     mock_apis: str = Field(default="available", description="Mock APIs status")
     timestamp: datetime = Field(
         default_factory=datetime.utcnow,

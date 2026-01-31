@@ -30,6 +30,7 @@ from .gmail_service import gmail_service
 from .gemini_service import gemini_service, extract_decision_from_email
 from .policy_store import policy_store
 from .mock_apis import get_all_customer_data
+from .graph_operations import find_precedents
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,22 @@ class DecisionEngine:
         if policy_info and exceptions:
             policy_info.exception_made = True
         
+        # Step 7.5: Find precedents from Neo4j
+        customer_industry = None
+        customer_arr = None
+        for ev in evidence:
+            if ev.field == "industry":
+                customer_industry = ev.value
+            elif ev.field == "arr":
+                customer_arr = ev.value
+        
+        precedents = await find_precedents(
+            customer_industry=customer_industry,
+            customer_arr=customer_arr,
+            decision_type=request.decision_type.value,
+            limit=5
+        )
+        
         # Step 8: Construct final decision trace
         decision_trace = DecisionTrace(
             decision_id=f"dec_{uuid.uuid4().hex[:12]}",
@@ -180,13 +197,13 @@ class DecisionEngine:
             decision=decision_outcome,
             evidence=evidence,
             policy=policy_info,
-            precedents=[],  # Will be populated in Part 2 (Neo4j)
+            precedents=precedents,  # Populated from Neo4j
             exceptions=exceptions,
             source=source,
             raw_email_text=email_text
         )
         
-        # Store in memory (for Part 2 when Neo4j is added)
+        # Store in memory (kept for backward compatibility)
         self._decisions[decision_trace.decision_id] = decision_trace
         
         logger.info(

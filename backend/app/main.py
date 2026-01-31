@@ -35,6 +35,13 @@ from .gmail_service import gmail_service
 from .gemini_service import gemini_service
 from .policy_store import get_all_policies, get_current_policy
 from .mock_apis import router as mock_api_router
+from .neo4j_service import neo4j_service
+from .graph_operations import (
+    save_decision_trace,
+    get_decision_by_id,
+    get_pattern_analysis,
+    list_recent_decisions
+)
 
 # Configure logging
 logging.basicConfig(
@@ -135,10 +142,14 @@ async def health_check():
     else:
         gemini_result = "not_configured"
     
+    # Check Neo4j status
+    neo4j_result = "connected" if neo4j_service.health_check() else "disconnected"
+    
     return HealthCheckResponse(
         status="healthy",
         gmail=gmail_result,
         gemini=gemini_result,
+        neo4j=neo4j_result,
         mock_apis="available",
         timestamp=datetime.utcnow()
     )
@@ -189,7 +200,13 @@ async def ingest_decision(request: EmailIngestionRequest):
         
         decision_trace = await decision_engine.construct_decision_trace(request)
         
-        logger.info(f"Decision trace created: {decision_trace.decision_id}")
+        # Save to Neo4j
+        saved = await save_decision_trace(decision_trace)
+        if not saved:
+            logger.warning(f"Failed to save decision {decision_trace.decision_id} to Neo4j")
+        else:
+            logger.info(f"Decision trace saved to Neo4j: {decision_trace.decision_id}")
+        
         return decision_trace
         
     except ValueError as e:
@@ -411,6 +428,79 @@ async def get_current_policy_endpoint():
 
 
 # =============================================================================
+# NEO4J ENDPOINTS
+# =============================================================================
+
+@app.get("/decisions/patterns", tags=["Neo4j Analytics"])
+async def get_patterns(
+    industry: Optional[str] = Query(None, description="Filter by industry"),
+    decision_type: str = Query("discount_approval", description="Decision type")
+):
+    """
+    Analyze decision patterns.
+    
+    Returns:
+    - Approval rate
+    - Total decisions
+    - Top approvers
+    - Common exception types
+    """
+    patterns = await get_pattern_analysis(industry, decision_type)
+    return patterns
+
+
+@app.get("/decision/explain/{decision_id}", tags=["Neo4j Analytics"])
+async def explain_decision(decision_id: str):
+    """
+    Get formatted ground truth explanation of a decision.
+    
+    Returns a human-readable explanation with all context.
+    """
+    decision = await get_decision_by_id(decision_id)
+    if not decision:
+        raise HTTPException(status_code=404, detail=f"Decision {decision_id} not found")
+    
+    # Format explanation
+    explanation = {
+        "decision_id": decision_id,
+        "summary": f"{decision.get('outcome', 'Unknown').title()}: {decision.get('final_action', 'Unknown')} for {decision.get('customer_name', 'Unknown')}",
+        "decision_maker": decision.get("decision_maker_email"),
+        "timestamp": str(decision.get("timestamp")),
+        "reasoning": decision.get("decision_reasoning"),
+        "evidence": {
+            f"{e.get('field', 'unknown')} ({e.get('source', 'unknown')})": e.get('value')
+            for e in decision.get("evidence", [])
+        },
+        "policy": decision.get("policy"),
+        "precedents_count": len(decision.get("precedents", [])),
+        "full_trace": decision
+    }
+    
+    return explanation
+
+
+@app.get("/neo4j/stats", tags=["Neo4j Analytics"])
+async def get_neo4j_stats():
+    """
+    Get Neo4j database statistics.
+    
+    Returns counts of nodes and relationships.
+    """
+    return neo4j_service.get_stats()
+
+
+@app.get("/neo4j/decisions", tags=["Neo4j Analytics"])
+async def get_neo4j_decisions(limit: int = Query(10, ge=1, le=100)):
+    """
+    List recent decisions from Neo4j.
+    
+    Returns decisions ordered by timestamp descending.
+    """
+    decisions = await list_recent_decisions(limit)
+    return {"count": len(decisions), "decisions": decisions}
+
+
+# =============================================================================
 # STARTUP/SHUTDOWN EVENTS
 # =============================================================================
 
@@ -435,9 +525,20 @@ async def startup_event():
             "GEMINI_API_KEY not configured. "
             "LLM extraction will use fallback pattern matching."
         )
+    
+    # Check Neo4j connection
+    if neo4j_service.is_connected():
+        stats = neo4j_service.get_stats()
+        logger.info(f"Neo4j connected: {stats['total_nodes']} nodes, {stats['relationships']} relationships")
+    else:
+        logger.warning(
+            "Neo4j not connected. "
+            "Graph storage features will be disabled."
+        )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown tasks."""
     logger.info("Context Graph Decision Engine shutting down...")
+    neo4j_service.close()

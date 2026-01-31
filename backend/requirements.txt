@@ -22,3 +22,6 @@ python-dateutil==2.8.2
 
 # Neo4j (Part 2)
 neo4j==5.17.0
+
+# Seed Data Generation
+faker==22.6.0
