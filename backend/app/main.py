@@ -15,6 +15,12 @@ Endpoints:
 - GET /api/mock/*       - Mock API endpoints (CRM, Support, Finance)
 """
 import logging
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 from datetime import datetime
 from typing import Optional, List
 
@@ -42,6 +48,7 @@ from .graph_operations import (
     get_pattern_analysis,
     list_recent_decisions
 )
+from .gmail_monitor import gmail_monitor
 
 # Configure logging
 logging.basicConfig(
@@ -378,8 +385,204 @@ async def get_gmail_thread(thread_id: str):
 
 
 # =============================================================================
-# POLICY ENDPOINTS
+# GMAIL MONITOR ENDPOINTS
 # =============================================================================
+
+@app.get(
+    "/gmail/preview",
+    tags=["Gmail Monitor"],
+    responses={500: {"model": APIError}}
+)
+async def preview_gmail_inbox(
+    query: str = Query("subject:discount", description="Gmail search query"),
+    max_results: int = Query(5, ge=1, le=20, description="Maximum results")
+):
+    """
+    Preview emails in Gmail matching the query.
+    
+    Use this to see what's available before ingesting.
+    Returns emails with their IDs, subjects, senders, and dates.
+    
+    **Examples:**
+    - `subject:discount` - Find emails with "discount" in subject
+    - `subject:(discount OR approval)` - Multiple keywords
+    - `subject:discount after:2026/01/30` - Recent emails only
+    """
+    try:
+        messages = await gmail_monitor.search_decision_emails(query, max_results)
+        
+        return {
+            "query": query,
+            "count": len(messages),
+            "messages": messages
+        }
+        
+    except Exception as e:
+        logger.error(f"Gmail preview failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/gmail/unprocessed",
+    tags=["Gmail Monitor"],
+    responses={500: {"model": APIError}}
+)
+async def get_unprocessed_emails(
+    query: str = Query(
+        "subject:(discount OR approval)",
+        description="Gmail search query"
+    ),
+    max_results: int = Query(10, ge=1, le=50, description="Maximum to search")
+):
+    """
+    List decision emails in Gmail that haven't been ingested yet.
+    
+    Filters out emails that have already been processed by this session.
+    """
+    try:
+        unprocessed = await gmail_monitor.get_unprocessed_emails(query, max_results)
+        stats = gmail_monitor.get_stats()
+        
+        return {
+            "unprocessed_count": len(unprocessed),
+            "processed_count": stats["processed_count"],
+            "emails": unprocessed
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get unprocessed emails: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/gmail/ingest/{message_id}",
+    tags=["Gmail Monitor"],
+    responses={
+        404: {"model": APIError},
+        500: {"model": APIError}
+    }
+)
+async def ingest_gmail_message(
+    message_id: str,
+    customer_name: str = Query(..., description="Customer name for decision")
+):
+    """
+    Ingest a specific Gmail message by ID.
+    
+    **Process:**
+    1. Fetch email thread from Gmail
+    2. Extract decision data with Gemini LLM
+    3. Enrich with mock API data (CRM/Support/Finance)
+    4. Store in Neo4j
+    5. Return complete decision trace
+    
+    **Tip:** Use `/gmail/preview` first to get message IDs.
+    """
+    result = await gmail_monitor.ingest_email(
+        message_id=message_id,
+        customer_name=customer_name,
+        auto_save=True
+    )
+    
+    if not result["success"]:
+        if "not found" in result.get("error", "").lower():
+            raise HTTPException(status_code=404, detail=result["error"])
+        raise HTTPException(status_code=500, detail=result["error"])
+    
+    return {
+        "success": True,
+        "message_id": message_id,
+        "decision_id": result["decision_id"],
+        "saved_to_neo4j": result["saved_to_neo4j"],
+        "decision_trace": result["trace"]
+    }
+
+
+@app.post(
+    "/gmail/batch-ingest",
+    tags=["Gmail Monitor"],
+    responses={500: {"model": APIError}}
+)
+async def batch_ingest_emails(
+    query: str = Query(
+        "subject:(discount OR approval)",
+        description="Gmail search query"
+    ),
+    customer_name: Optional[str] = Query(
+        None,
+        description="Customer name (if not provided, extracted from subject)"
+    ),
+    max_results: int = Query(10, ge=1, le=50, description="Maximum to process")
+):
+    """
+    Search Gmail and ingest all matching unprocessed emails.
+    
+    If `customer_name` is not provided, the system attempts to extract it
+    from the email subject line. Common patterns:
+    - "Discount Request - MedTech Corp" → MedTech Corp
+    - "Approval Request: HealthTech Inc" → HealthTech Inc
+    
+    **Example:**
+    ```
+    POST /gmail/batch-ingest?query=subject:discount%20after:2026/01/30
+    ```
+    """
+    try:
+        result = await gmail_monitor.batch_ingest(
+            query=query,
+            customer_name=customer_name,
+            max_results=max_results
+        )
+        
+        return {
+            "summary": {
+                "total_found": result["total"],
+                "successful": result["successful"],
+                "failed": result["failed"]
+            },
+            "results": result["results"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Batch ingest failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/gmail/stats",
+    tags=["Gmail Monitor"]
+)
+async def get_gmail_stats(
+    query: str = Query(
+        "subject:(discount OR approval)",
+        description="Query to check for total available"
+    )
+):
+    """
+    Get statistics about Gmail monitoring.
+    
+    Returns:
+    - Total emails matching pattern
+    - Processed count (ingested this session)
+    - Unprocessed count (available to ingest)
+    - Last check time
+    """
+    # Get current stats
+    stats = gmail_monitor.get_stats()
+    
+    # Search for total matching emails
+    all_emails = await gmail_monitor.search_decision_emails(query, max_results=50)
+    unprocessed = await gmail_monitor.get_unprocessed_emails(query, max_results=50)
+    
+    return {
+        "total_matching": len(all_emails),
+        "processed_count": stats["processed_count"],
+        "unprocessed_count": len(unprocessed),
+        "last_check_time": stats["last_check_time"],
+        "query_used": query
+    }
+
+
 
 @app.get(
     "/policies",
@@ -452,31 +655,40 @@ async def get_patterns(
 @app.get("/decision/explain/{decision_id}", tags=["Neo4j Analytics"])
 async def explain_decision(decision_id: str):
     """
-    Get formatted ground truth explanation of a decision.
+    Get natural language explanation of a decision (GROUND TRUTH).
     
-    Returns a human-readable explanation with all context.
+    Now generates human-readable explanation using LLM,
+    based entirely on factual data from graph (not hallucinated).
+    
+    Returns:
+    - explanation: LLM-generated natural language explanation
+    - raw_data: The underlying decision data for verification
     """
+    from .explanation_service import generate_decision_explanation
+    
     decision = await get_decision_by_id(decision_id)
     if not decision:
         raise HTTPException(status_code=404, detail=f"Decision {decision_id} not found")
     
-    # Format explanation
-    explanation = {
+    # Generate natural language explanation
+    explanation_text = await generate_decision_explanation(decision)
+    
+    # Also provide structured summary for quick reference
+    structured_summary = {
         "decision_id": decision_id,
         "summary": f"{decision.get('outcome', 'Unknown').title()}: {decision.get('final_action', 'Unknown')} for {decision.get('customer_name', 'Unknown')}",
         "decision_maker": decision.get("decision_maker_email"),
         "timestamp": str(decision.get("timestamp")),
-        "reasoning": decision.get("decision_reasoning"),
-        "evidence": {
-            f"{e.get('field', 'unknown')} ({e.get('source', 'unknown')})": e.get('value')
-            for e in decision.get("evidence", [])
-        },
-        "policy": decision.get("policy"),
-        "precedents_count": len(decision.get("precedents", [])),
-        "full_trace": decision
+        "precedents_count": len(decision.get("precedents", []))
     }
     
-    return explanation
+    return {
+        "decision_id": decision_id,
+        "explanation": explanation_text,
+        "structured_summary": structured_summary,
+        "raw_data": decision  # Include raw data for verification
+    }
+
 
 
 @app.get("/neo4j/stats", tags=["Neo4j Analytics"])
@@ -498,6 +710,47 @@ async def get_neo4j_decisions(limit: int = Query(10, ge=1, le=100)):
     """
     decisions = await list_recent_decisions(limit)
     return {"count": len(decisions), "decisions": decisions}
+
+
+# =============================================================================
+# TEST/DEBUG ENDPOINTS
+# =============================================================================
+
+from pydantic import BaseModel
+
+class ExtractTestRequest(BaseModel):
+    """Request model for testing LLM extraction."""
+    email_text: str
+    customer_name: str
+
+
+@app.post("/test/extract", tags=["Testing"])
+async def test_extraction(request: ExtractTestRequest):
+    """
+    Test endpoint to see LLM extraction results.
+    
+    Useful for debugging and testing different email formats.
+    Returns extracted data with confidence scores.
+    
+    Example:
+    ```json
+    {
+        "email_text": "From: john@company.com\\nTo: jane@company.com\\n\\nCan we do 18%?\\n\\n---\\nFrom: jane@company.com\\n\\nLGTM",
+        "customer_name": "Test Corp"
+    }
+    ```
+    """
+    extracted = await gemini_service.extract_decision_from_email(
+        request.email_text,
+        request.customer_name
+    )
+    
+    return {
+        "extracted_data": extracted,
+        "confidence_scores": extracted.get('confidence', {}),
+        "status": "success"
+    }
+
 
 
 # =============================================================================

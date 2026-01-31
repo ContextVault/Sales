@@ -25,3 +25,9 @@ neo4j==5.17.0
 
 # Seed Data Generation
 faker==22.6.0
+
+# Part 3: LLM Semantic Similarity
+numpy>=1.24.0
+
+# CLI Output Formatting
+rich==13.7.0

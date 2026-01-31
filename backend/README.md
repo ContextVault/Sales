@@ -189,6 +189,67 @@ curl -X POST http://localhost:8000/decision/ingest \
 - Standard: 10%, Manager: 15%, VP: 25% (increased)
 - New: Enterprise Special up to 30% with CFO
 
+## Real Gmail Testing
+
+### Step 1: Send Test Email
+
+Open Gmail and send an email to yourself:
+
+```
+To: your-email@gmail.com
+Subject: Discount Request - MedTech Corp
+
+Can we approve 18% discount for MedTech Corp?
+They have 3 SEV-1 incidents and are threatening churn.
+
+- John Sales
+```
+
+Reply to yourself:
+
+```
+Approved at 15%. 18% is too high given margin.
+
+- Jane Manager
+```
+
+### Step 2: Search Gmail
+
+```bash
+curl "http://localhost:8000/gmail/preview?query=subject:discount"
+```
+
+### Step 3: Ingest Email
+
+```bash
+# Copy message ID from Step 2
+curl -X POST "http://localhost:8000/gmail/ingest/MESSAGE_ID?customer_name=MedTech%20Corp"
+```
+
+### Step 4: Query Decision
+
+```bash
+# Copy decision ID from Step 3
+curl "http://localhost:8000/decision/explain/DECISION_ID"
+```
+
+### Interactive Testing Script
+
+```bash
+# Install rich for formatted output
+pip install rich
+
+# Run interactive CLI tool
+python -m app.test_real_emails
+```
+
+### Batch Ingestion
+
+```bash
+# Ingest all matching emails at once
+curl -X POST "http://localhost:8000/gmail/batch-ingest?query=subject:discount"
+```
+
 ## Project Structure
 
 ```
@@ -201,7 +262,11 @@ backend/
 │   ├── policy_store.py      # Policy version management
 │   ├── gmail_service.py     # Gmail API integration
 │   ├── gemini_service.py    # Gemini LLM integration
-│   └── decision_engine.py   # Core orchestration logic
+│   ├── decision_engine.py   # Core orchestration logic
+│   ├── gmail_monitor.py     # Gmail monitoring & ingestion
+│   ├── graph_operations.py  # Neo4j read/write operations
+│   ├── neo4j_service.py     # Neo4j connection management
+│   └── test_real_emails.py  # CLI testing tool
 ├── credentials.json         # Gmail OAuth (not in git)
 ├── token.json              # Gmail token (auto-generated)
 ├── .env                    # Environment variables
@@ -209,6 +274,16 @@ backend/
 ├── requirements.txt        # Python dependencies
 └── README.md              # This file
 ```
+
+## Gmail Monitor API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/gmail/preview` | GET | Preview emails matching query |
+| `/gmail/unprocessed` | GET | List emails not yet ingested |
+| `/gmail/ingest/{id}` | POST | Ingest single email by ID |
+| `/gmail/batch-ingest` | POST | Batch ingest matching emails |
+| `/gmail/stats` | GET | Get monitoring statistics |
 
 ## API Documentation
 

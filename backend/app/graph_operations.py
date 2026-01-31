@@ -489,6 +489,140 @@ async def find_precedents(
         return []
 
 
+async def find_semantic_precedents(
+    decision_summary: str,
+    customer_industry: Optional[str],
+    customer_arr: Optional[int],
+    decision_type: str,
+    limit: int = 5
+) -> List[Precedent]:
+    """
+    Find precedents using SEMANTIC SIMILARITY instead of just rules.
+    
+    Optimized to reduce API calls:
+    1. Generates decision embedding once
+    2. Limits candidate search
+    3. Only generates explanations for top matches
+    """
+    from .gemini_service import gemini_service
+    import numpy as np
+    
+    if not neo4j_service.is_connected():
+        return []
+    
+    # Step 1: Generate embedding for current decision (ONCE)
+    decision_embedding = await gemini_service.generate_embeddings(decision_summary)
+    
+    if not decision_embedding:
+        # Fallback to rule-based if embedding fails
+        logger.warning("Embedding generation failed, using rule-based precedent matching")
+        return await find_precedents(customer_industry, customer_arr, decision_type, limit)
+    
+    # Step 2: Get candidate decisions from Neo4j (Reduced limit)
+    # limit 10 instead of 20 to save embedding calls
+    with neo4j_service.get_session() as session:
+        result = session.run("""
+            MATCH (d:Decision)
+            WHERE d.type = $type
+            RETURN d.id as decision_id,
+                   d.customer_name as customer,
+                   d.customer_industry as industry,
+                   d.customer_arr as arr,
+                   d.final_action as outcome,
+                   d.timestamp as timestamp,
+                   d.request_reason as reason,
+                   d.decision_reasoning as reasoning
+            ORDER BY d.timestamp DESC
+            LIMIT 10
+        """, {"type": decision_type})
+        
+        candidates = [dict(record) for record in result]
+    
+    if not candidates:
+        return []
+    
+    # Step 3: Calculate semantic similarity efficiently
+    similarities = []
+    decision_vec = np.array(decision_embedding)
+    norm_decision = np.linalg.norm(decision_vec)
+    
+    for candidate in candidates:
+        # Create summary for precedent
+        precedent_summary = f"""
+Discount: {candidate.get('outcome', 'Unknown')}
+Industry: {candidate.get('industry', 'Unknown')}
+ARR: ${candidate.get('arr', 'Unknown')}
+Reason: {candidate.get('reason', '')}
+Reasoning: {candidate.get('reasoning', '')}
+"""
+        # Generate embedding for candidate (1 call per candidate)
+        precedent_embedding = await gemini_service.generate_embeddings(precedent_summary)
+        
+        if not precedent_embedding:
+            continue
+            
+        # Calculate cosine similarity locally (No extra API call)
+        precedent_vec = np.array(precedent_embedding)
+        norm_precedent = np.linalg.norm(precedent_vec)
+        
+        if norm_decision == 0 or norm_precedent == 0:
+            similarity = 0.0
+        else:
+            similarity = np.dot(decision_vec, precedent_vec) / (norm_decision * norm_precedent)
+            
+        similarities.append({
+            'candidate': candidate,
+            'similarity': float(similarity),
+            'precedent_summary': precedent_summary
+        })
+    
+    # Step 4: Sort by similarity and take top N
+    similarities.sort(key=lambda x: x['similarity'], reverse=True)
+    top_matches = similarities[:limit]
+    
+    # Step 5: Convert to Precedent objects
+    # Only explain the VERY top matches to save quota (max 2)
+    precedents = []
+    for i, item in enumerate(top_matches):
+        candidate = item['candidate']
+        similarity_score = item['similarity']
+        
+        # Skip if similarity is too low
+        if similarity_score < 0.5:
+            continue
+        
+        # Only generate expensive LLM explanation for top 3 matches
+        if i < 3:
+            explanation = await gemini_service.explain_decision_similarity(
+                decision_summary,
+                item['precedent_summary'],
+                similarity_score
+            )
+        else:
+            explanation = f"High semantic similarity ({similarity_score:.2f}) based on context"
+        
+        # Parse timestamp
+        timestamp = candidate.get('timestamp')
+        if timestamp and hasattr(timestamp, 'to_native'):
+            timestamp = timestamp.to_native()
+        elif not timestamp:
+            timestamp = datetime.utcnow()
+        
+        precedents.append(Precedent(
+            decision_id=candidate['decision_id'],
+            customer=candidate['customer'],
+            outcome=candidate['outcome'],
+            similarity_score=similarity_score,
+            timestamp=timestamp,
+            why_similar=explanation
+        ))
+        
+        logger.info(f"Precedent {candidate['decision_id']}: similarity={similarity_score:.2f}")
+    
+    return precedents
+
+
+
 async def get_pattern_analysis(
     industry: Optional[str] = None,
     decision_type: str = "discount_approval"

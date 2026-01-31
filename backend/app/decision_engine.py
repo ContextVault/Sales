@@ -12,7 +12,7 @@ Orchestrates the complete decision trace construction process:
 import asyncio
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from .models import (
@@ -30,7 +30,7 @@ from .gmail_service import gmail_service
 from .gemini_service import gemini_service, extract_decision_from_email
 from .policy_store import policy_store
 from .mock_apis import get_all_customer_data
-from .graph_operations import find_precedents
+from .graph_operations import find_precedents, find_semantic_precedents
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ class DecisionEngine:
         if policy_info and exceptions:
             policy_info.exception_made = True
         
-        # Step 7.5: Find precedents from Neo4j
+        # Step 7.5: Find precedents using semantic similarity
         customer_industry = None
         customer_arr = None
         for ev in evidence:
@@ -181,7 +181,17 @@ class DecisionEngine:
             elif ev.field == "arr":
                 customer_arr = ev.value
         
-        precedents = await find_precedents(
+        # Create decision summary for semantic matching
+        decision_summary = self._create_decision_summary(
+            extracted=extracted,
+            customer_industry=customer_industry,
+            customer_arr=customer_arr,
+            customer_data=customer_data
+        )
+        
+        # Use semantic precedent matching (falls back to rule-based if embeddings fail)
+        precedents = await find_semantic_precedents(
+            decision_summary=decision_summary,
             customer_industry=customer_industry,
             customer_arr=customer_arr,
             decision_type=request.decision_type.value,
@@ -212,6 +222,33 @@ class DecisionEngine:
         
         return decision_trace
     
+    def _create_decision_summary(
+        self,
+        extracted: Dict[str, Any],
+        customer_industry: Optional[str],
+        customer_arr: Optional[Any],
+        customer_data: Dict[str, Any]
+    ) -> str:
+        """
+        Create text summary of decision for semantic matching.
+        
+        This captures the "essence" of the decision for similarity comparison.
+        """
+        sev1_tickets = 0
+        if customer_data.get("support"):
+            sev1_tickets = customer_data["support"].get("sev1_tickets", 0)
+        
+        summary = f"""
+Discount request: {extracted.get('requested_discount', 'Unknown')} requested, {extracted.get('final_discount', 'Unknown')} approved
+Customer industry: {customer_industry or 'Unknown'}
+Customer ARR: ${customer_arr or 'Unknown'}
+Request reason: {extracted.get('reason', 'Not specified')}
+Decision reasoning: {extracted.get('reasoning', 'Not specified')}
+Service issues: {sev1_tickets} SEV-1 tickets
+Outcome: {extracted.get('outcome', 'Unknown')}
+"""
+        return summary.strip()
+    
     def _parse_timestamp(self, timestamp_str: Optional[str]) -> Optional[datetime]:
         """
         Parse ISO 8601 timestamp string to datetime.
@@ -222,15 +259,23 @@ class DecisionEngine:
             return None
         
         try:
+            dt = None
             # Handle ISO 8601 format
             if "T" in timestamp_str:
                 # Remove 'Z' suffix if present
                 ts = timestamp_str.replace("Z", "+00:00")
-                return datetime.fromisoformat(ts)
+                dt = datetime.fromisoformat(ts)
             else:
                 # Try basic date parsing
                 from dateutil import parser
-                return parser.parse(timestamp_str)
+                dt = parser.parse(timestamp_str)
+            
+            # Ensure UTC and naive for policy comparison
+            if dt and dt.tzinfo is not None:
+                # Convert to UTC then remove tzinfo to make it naive
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                
+            return dt
         except Exception as e:
             logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
             return None
