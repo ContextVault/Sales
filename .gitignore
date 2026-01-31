@@ -1,0 +1,14 @@
+*.pyc
+__pycache__/
+.env
+venv/
+.DS_Store
+node_modules/
+credentials.json
+token.json
+*.log
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
